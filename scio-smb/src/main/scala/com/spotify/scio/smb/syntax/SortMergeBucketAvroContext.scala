@@ -19,18 +19,18 @@ package com.spotify.scio.smb.syntax
 
 import com.spotify.scio.ScioContext
 import com.spotify.scio.avro._
-import com.spotify.scio.coders.Coder
+import com.spotify.scio.coders.{Coder, CoderMaterializer}
 import com.spotify.scio.smb._
 import com.spotify.scio.util.ScioUtil
 import com.spotify.scio.values.SCollection
 import org.apache.avro.Schema
 import org.apache.avro.generic.GenericRecord
-import org.apache.avro.specific.{SpecificRecord, SpecificRecordBase}
+import org.apache.avro.specific.SpecificRecordBase
 import org.apache.beam.sdk.extensions.smb.{AvroSortedBucketIO, SortedBucketIO}
 import org.apache.beam.sdk.io.FileSystems
-import org.apache.beam.sdk.io.fs.{EmptyMatchTreatment, ResolveOptions, ResourceId}
 import org.apache.beam.sdk.io.fs.MatchResult.Status
 import org.apache.beam.sdk.io.fs.ResolveOptions.StandardResolveOptions
+import org.apache.beam.sdk.io.fs.{EmptyMatchTreatment, ResourceId}
 import org.apache.beam.sdk.values.TupleTag
 
 import scala.reflect.ClassTag
@@ -47,16 +47,23 @@ object SortMergeBucketAvroContext {
 
     def nonSmbRead: ScioContext => SCollection[V] = ???
 
-    def directory: ResourceId
+    def directories: List[ResourceId]
 
     def supportsSmb: Boolean =
-      FileSystems.`match`(
-        directory.resolve("metadata.json", StandardResolveOptions.RESOLVE_FILE).toString,
-        EmptyMatchTreatment.DISALLOW
-      ).status() == Status.OK
+      directories.forall { directory =>
+        FileSystems
+          .`match`(
+            directory.resolve("metadata.json", StandardResolveOptions.RESOLVE_FILE).toString,
+            EmptyMatchTreatment.DISALLOW
+          )
+          .status() == Status.OK
+      }
   }
 
   object SmbJoinInput {
+    import org.apache.beam.sdk.io.{AvroIO => BAvroIO}
+    import scala.collection.JavaConverters._
+
     private def toResourceDir(filename: String): ResourceId = {
       val matchResult = FileSystems.`match`(filename, EmptyMatchTreatment.DISALLOW)
 
@@ -68,78 +75,89 @@ object SortMergeBucketAvroContext {
       }
     }
 
-    def ofSpecificRecord[T <: SpecificRecordBase : ClassTag : Coder](filename: String): SmbJoinInput[T] =
-      new SmbJoinInput[T] {
-        override def directory: ResourceId = toResourceDir(filename)
+    def ofSpecificRecord[T <: SpecificRecordBase: ClassTag: Coder](
+      paths: List[String]
+    ): SmbJoinInput[T] = new SmbJoinInput[T] {
+      override def directories: List[ResourceId] = paths.map(toResourceDir)
 
-        override def smbRead: SortedBucketIO.Read[T] = AvroSortedBucketIO
-          .read[T](new TupleTag[T](), ScioUtil.classOf[T])
-          .from(directory.toString)
+      override def smbRead: SortedBucketIO.Read[T] =
+        AvroSortedBucketIO
+          .read(new TupleTag[T](), ScioUtil.classOf[T])
+          .from(directories.map(_.toString).asJava)
 
-        override def nonSmbRead: ScioContext => SCollection[T] =
-          _.avroFile[T](s"$directory/*.avro")
-      }
+      override def nonSmbRead: ScioContext => SCollection[T] =
+        directories match {
+          case singleDir :: Nil => _.avroFile[T](s"$singleDir/*.avro")
+          case _: List[ResourceId] =>
+            _.parallelize(directories.map(dir => s"$dir/*.avro"))
+              .readFiles(BAvroIO.readFiles(ScioUtil.classOf[T]))
+        }
+    }
 
     def ofGenericRecord(
-      filename: String,
+      paths: List[String],
       schema: Schema
     ): SmbJoinInput[GenericRecord] = new SmbJoinInput[GenericRecord] {
-      override def directory: ResourceId = toResourceDir(filename)
+      override def directories: List[ResourceId] = paths.map(toResourceDir)
 
-      override def smbRead: SortedBucketIO.Read[GenericRecord] = AvroSortedBucketIO
-        .read(new TupleTag[GenericRecord](), schema)
-        .from(directory.toString)
+      override def smbRead: SortedBucketIO.Read[GenericRecord] =
+        AvroSortedBucketIO
+          .read(new TupleTag[GenericRecord](), schema)
+          .from(directories.map(_.toString).asJava)
 
-      override def nonSmbRead: ScioContext => SCollection[GenericRecord] =
-        _.avroFile[GenericRecord](s"$directory/*.avro", schema)
+      override def nonSmbRead: ScioContext => SCollection[GenericRecord] = {
+        implicit val grCoder = Coder.avroGenericRecordCoder(schema)
+
+        directories match {
+          case singleDir :: Nil =>
+            _.avroFile[GenericRecord](s"$singleDir/*.avro", schema)
+          case _: List[ResourceId] =>
+            _.parallelize(directories.map(dir => s"$dir/*.avro"))
+              .readFiles(BAvroIO.readFilesGenericRecords(schema))
+        }
+      }
     }
   }
 }
 
-final class SortMergeBucketAvroContext(@transient private val self: ScioContext) extends Serializable {
+final class SortMergeBucketAvroContext(@transient private val self: ScioContext)
+    extends Serializable {
   import SortMergeBucketAvroContext._
 
-  def smbAvroFile[T <: SpecificRecordBase : ClassTag : Coder](
-    fileName: String
-  ): SmbAvroJoinBuilder[T] = SmbAvroJoinBuilder[T](SmbJoinInput.ofSpecificRecord[T](fileName))
+  def smbAvroFile[T <: SpecificRecordBase: ClassTag: Coder](
+    paths: String*
+  ): SmbAvroJoinBuilder[T] = SmbAvroJoinBuilder[T](SmbJoinInput.ofSpecificRecord[T](paths.toList))
 
-  def smbAvroFile(
-    fileName: String,
-    schema: Schema
-  ): SmbAvroJoinBuilder[GenericRecord] =
-    SmbAvroJoinBuilder[GenericRecord](SmbJoinInput.ofGenericRecord(fileName, schema))
+  def smbAvroFile(paths: String*)(schema: Schema): SmbAvroJoinBuilder[GenericRecord] =
+    SmbAvroJoinBuilder[GenericRecord](SmbJoinInput.ofGenericRecord(paths.toList, schema))
 
   final case class SmbAvroJoinBuilder[I1: Coder](input1: SmbJoinInput[I1]) {
     def groupByKey: SmbGroupByKeyBuilder[I1] =
       SmbGroupByKeyBuilder[I1](input1)
 
-    def join[I2 <: SpecificRecordBase : ClassTag : Coder](
-      fileName: String
+    def join[I2 <: SpecificRecordBase: ClassTag: Coder](
+      paths: String*
     ): SmbJoinBuilder2[I1, I2] =
-      SmbJoinBuilder2[I1, I2](input1, SmbJoinInput.ofSpecificRecord[I2](fileName))
+      SmbJoinBuilder2[I1, I2](input1, SmbJoinInput.ofSpecificRecord[I2](paths.toList))
 
-    def join(
-      fileName: String,
-      schema: Schema
-    ): SmbJoinBuilder2[I1, GenericRecord] = SmbJoinBuilder2[I1, GenericRecord](
-      input1, SmbJoinInput.ofGenericRecord(fileName, schema)
-    )
+    def join(paths: String*)(schema: Schema): SmbJoinBuilder2[I1, GenericRecord] =
+      SmbJoinBuilder2[I1, GenericRecord](input1, SmbJoinInput.ofGenericRecord(paths.toList, schema))
 
-    def cogroup[I2 <: SpecificRecordBase : ClassTag : Coder](
-      fileName: String
+    def cogroup[I2 <: SpecificRecordBase: ClassTag: Coder](
+      paths: String*
     ): SmbCoGroupBuilder2[I1, I2] =
-      SmbCoGroupBuilder2[I1, I2](input1, SmbJoinInput.ofSpecificRecord[I2](fileName))
+      SmbCoGroupBuilder2[I1, I2](input1, SmbJoinInput.ofSpecificRecord[I2](paths.toList))
 
-    def cogroup(
-      fileName: String,
-      schema: Schema
-    ): SmbCoGroupBuilder2[I1, GenericRecord] = SmbCoGroupBuilder2[I1, GenericRecord](
-      input1, SmbJoinInput.ofGenericRecord(fileName, schema)
-    )
+    def cogroup(paths: String*)(schema: Schema): SmbCoGroupBuilder2[I1, GenericRecord] =
+      SmbCoGroupBuilder2[I1, GenericRecord](
+        input1,
+        SmbJoinInput.ofGenericRecord(paths.toList, schema)
+      )
   }
 
   final case class SmbJoinBuilder2[I1: Coder, I2: Coder](
-    input1: SmbJoinInput[I1], input2: SmbJoinInput[I2]
+    input1: SmbJoinInput[I1],
+    input2: SmbJoinInput[I2]
   ) {
     def on[K: Coder](keyClass: Class[K]) =
       new SmbTryJoin[SCollection[(K, (I1, I2))], (SCollection[I1], SCollection[I2])](
@@ -161,18 +179,24 @@ final class SortMergeBucketAvroContext(@transient private val self: ScioContext)
   }
 
   final case class SmbCoGroupBuilder2[I1: Coder, I2: Coder](
-    input1: SmbJoinInput[I1], input2: SmbJoinInput[I2]
+    input1: SmbJoinInput[I1],
+    input2: SmbJoinInput[I2]
   ) {
-    def and[I3 <: SpecificRecordBase : ClassTag : Coder](
-      fileName: String
+    def and[I3 <: SpecificRecordBase: ClassTag: Coder](
+      paths: String*
     ): SmbCoGroupBuilder3[I1, I2, I3] =
-    SmbCoGroupBuilder3[I1, I2, I3](input1, input2, SmbJoinInput.ofSpecificRecord[I3](fileName))
+      SmbCoGroupBuilder3[I1, I2, I3](
+        input1,
+        input2,
+        SmbJoinInput.ofSpecificRecord[I3](paths.toList)
+      )
 
-    def and(
-      fileName: String,
-      schema: Schema
-    ): SmbCoGroupBuilder3[I1, I2, GenericRecord] = SmbCoGroupBuilder3[I1, I2, GenericRecord](
-      input1, input2, SmbJoinInput.ofGenericRecord(fileName, schema))
+    def and(paths: String*)(schema: Schema): SmbCoGroupBuilder3[I1, I2, GenericRecord] =
+      SmbCoGroupBuilder3[I1, I2, GenericRecord](
+        input1,
+        input2,
+        SmbJoinInput.ofGenericRecord(paths.toList, schema)
+      )
 
     def on[K: Coder](keyClass: Class[K]) =
       new SmbTryJoin[
@@ -182,11 +206,13 @@ final class SortMergeBucketAvroContext(@transient private val self: ScioContext)
         _.sortMergeCoGroup(keyClass, input1.smbRead, input2.smbRead),
         sc => (input1.nonSmbRead(sc), input2.nonSmbRead(sc)),
         (input1.supportsSmb && input2.supportsSmb)
-    )
+      )
   }
 
   final case class SmbCoGroupBuilder3[I1: Coder, I2: Coder, I3: Coder](
-    input1: SmbJoinInput[I1], input2: SmbJoinInput[I2], input3: SmbJoinInput[I3]
+    input1: SmbJoinInput[I1],
+    input2: SmbJoinInput[I2],
+    input3: SmbJoinInput[I3]
   ) {
     def on[K: Coder](keyClass: Class[K]) =
       new SmbTryJoin[
@@ -203,15 +229,14 @@ final class SortMergeBucketAvroContext(@transient private val self: ScioContext)
     toSmbJoinResult: ScioContext => SmbJoinResult,
     toFallbackResult: ScioContext => FallbackResult,
     isSmbReadableCondition: Boolean
-   ) {
+  ) {
     def get: SmbJoinResult = toSmbJoinResult(self)
 
-    def getOrFallback: Either[SmbJoinResult, FallbackResult] = {
+    def getOrFallback: Either[SmbJoinResult, FallbackResult] =
       if (isSmbReadableCondition) {
         Left(toSmbJoinResult(self))
       } else {
         Right(toFallbackResult(self))
       }
-    }
   }
 }
